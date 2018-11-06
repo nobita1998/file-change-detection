@@ -1,0 +1,235 @@
+#!/bin/bash
+#程序说明：
+#文件完备性检测程序
+#
+#实现功能：
+#监测指定目录的指定类型文件变动情况，
+#对于删除的文件做日志记录
+#对于添加或修改的文件做内容取样
+
+BASEDIR=`dirname $0`                                #程序所在目录
+CONFFILE="$BASEDIR/checkfile.cfg"                   #任务配置文件
+LOGFILE="$BASEDIR/event.log"                        #运行记录文件
+CHECKDIR="$BASEDIR/chk/"                            #原始校验码存放文件保存目录
+SUMMARYDIR="$BASEDIR/summary/"                      #快照文件保存目录
+REMINDFLGFILE="$BASEDIR/remind.flg"                 #邮件发送标志文件
+REMINDINTERVAL=7200                                 #邮件提醒最短间隔时间
+
+declare -a aCheckList                              #declare array
+declare -a aFileList
+declare -a aCheckResult
+IFS=$'\n'                                         #设置只有回车为换行符
+FindCmd="/usr/bin/find"
+CheckCmd="/usr/bin/md5sum"
+
+#获取任务配置信息
+function GetConf()
+{
+  if ! [ -f $CONFFILE ]; then                      #没有文件
+    echo "ERROR:can not find checkfile">>$LOGFILE
+    return
+  fi
+  local ConfigList=`grep -v '^\s*#' $CONFFILE|sed '/^\s*$/d'|uniq`        #删除配置文件的空行
+  aCheckList=()
+  for i in $ConfigList                              #遍历文件
+  do
+    local Search=`echo $i|awk -F, '{print $1}'`     #Search为查询参数
+    local Arg=`echo $i|awk -F, '{print $2}'`      #查询附加参数,会添加到find的-name参数值中
+    local Type=`echo $i|awk -F, '{print $3}'`     #Type为操作类型，0：发现变更仅记录文件名不做摘要; 1：发现变更则做摘要
+    if (( ${#Search} < 2 )); then                 #   $#是传给脚本的参数个数
+      continue                                     #跳回for循环
+    fi
+    if (( ${#Type} < 1 )); then             
+      Type="1"                                     #检测取值默认值为1
+    fi
+    #利用MD5为每个任务生成唯一标识,也做为校验码存放文件的文件名
+    local tn=`echo "$Search"|$CheckCmd|awk '{print $1}'`   #产生原始校验码存放文件保存目录的md5码
+    
+    aCheckList=(${aCheckList[@]} "$Search,$Arg,$Type,$tn")  #地址 类型 检测取值 md5码
+  done
+}
+
+#校验符合条件文件内容
+function CheckFile()
+{
+  if (( ${#1} < 2 )); then
+    echo "ERROR:can not analyse check item $1">>$LOGFILE
+    return
+  fi
+  local Search=`echo $1|awk -F, '{print $1}'`           #待查目录
+  local Arg=`echo $1|awk -F, '{print $2}'`              #过滤条件
+  local Type=`echo $1|awk -F, '{print $3}'`             #检测类型
+  local Fn=$CHECKDIR`echo $1|awk -F, '{print $4}'`".chk"  #Fn=./chk/md5码,chk
+  local NeedCreate=0
+  local NewFile=()
+  local CheckOK=1
+  if [ -f $Fn ]; then                                  #如果为常规文件
+    if (( `wc -l $Fn|awk '{print $1}'` < 1 )); then
+                         #wc统计指定文件中的字节数字数行数，并将统计结果显示输出 wc -l 统计行数
+      NeedCreate=1
+    fi
+  else
+    NeedCreate=1
+  fi
+  NFlist=$(mktemp)
+  eval "$FindCmd $Search $Arg ! -type d |sort >$NFlist 2>>$LOGFILE"     #结果成功输入$NFlist 失败输入$LOGFILE
+                                                                    # echo "NeedCreate is $NeedCreate"=0
+  if (( $NeedCreate > 0 )); then                         #不是常规多于0行的文件                
+    `cat $NFlist |xargs $CheckCmd >$Fn 2>>$LOGFILE`       #查看文件内容 xargs 多行变单行
+    chmod 600 $Fn
+    return
+  else                                                 
+     #是常规多于0行的文件 判断是否新增了文件
+    OFlist=$(mktemp)                                  #OF means odd file
+    `cat $Fn|awk '{print $2}'|sort >$OFlist`        #echo "OFlIST IS $OFlist"= /tmp/tmp.random
+    NewFile=`comm -23 $NFlist $OFlist`         #文件比较命令comm(选项)(参数)-23不显示在第二个文件和两个文件都出现的内容
+    for i in $NewFile
+    do
+      if (( ${#i} < 2 )); then
+        continue
+      fi
+      if [ -f $i ]; then                     
+      #对增加的文件进行记录
+        aCheckResult=(${aCheckResult[@]} $i"_Increased!")
+        echo $i" Increased!" >>$LOGFILE
+        CheckOK=0
+        if [ $Type != "0" ]; then           #检测类型为1需要做摘要
+          GetSummary $i
+        fi
+      fi
+    done
+    rm -f $OFlist
+    rm -f $NFlist
+  fi
+  local FailedList=`$CheckCmd -c $Fn 2>/dev/null|grep FAILED|sed 's/: FAILED.*$//g'|sed '/^\s*$/d'`
+  for i in $FailedList
+  do
+    if (( ${#i} < 2 )); then
+      continue
+    fi
+    if [ -f $i ]; then
+      #对修改过的文件进行记录
+      aCheckResult=(${aCheckResult[@]} $i"_has_been_modified!")
+      echo $i" has been modified!" >>$LOGFILE
+      CheckOK=0
+      if [ $Type != "0" ]; then
+        GetSummary $i
+      fi
+    else
+      #对删除的文件进行记录
+      aCheckResult=(${aCheckResult[@]} $i"_can_not_found!")
+      echo $i" can not found!" >>$LOGFILE
+      CheckOK=0
+    fi
+  done
+  return $CheckOK
+}
+
+#对指定文件做摘要
+function GetSummary()
+{
+  if (( ${#1} < 1 )); then
+    return
+  fi
+  local SummFile=$SUMMARYDIR`date +%Y%m%d`".summ"   #加上年月日
+  if (( ${#2} > 3 )); then
+     SummFile=$2 
+  fi
+  echo "">>$SummFile
+  echo `date`>>$SummFile
+  echo $1>>$SummFile
+  echo "--------------------------------------------------" >>$SummFile
+  if  [ -f $1 ]; then
+    #例程只是简单取文件前5行做摘要,可以根据实际情况自行修改摘要方法
+    head -n 5 $1 >>$SummFile
+  else
+    echo "can not found file" >>$SummFile
+  fi
+  echo "==================================================" >>$SummFile
+  chmod 600 $SummFile
+}
+
+
+#main
+if ! [ -d $CHECKDIR ]; then
+  mkdir $CHECKDIR
+  chmod 700 $CHECKDIR
+fi
+if ! [ -d $SUMMARYDIR ]; then
+  mkdir $SUMMARYDIR
+  chmod 700 $SUMMARYDIR
+fi
+GetConf                                              #运行配置文件
+OutputFile=""
+while getopts :ichsm opt
+do
+  case $opt in
+  i)
+    for i in ${aCheckList[@]}
+    do
+      Search=`echo $i|awk -F, '{print $1}'`
+      Arg=`echo $i|awk -F, '{print $2}'`
+      Fn=$CHECKDIR`echo $i|awk -F, '{print $4}'`".chk"
+      eval "$FindCmd $Search $Arg -exec $CheckCmd {} \; >$Fn 2>>$LOGFILE"
+      chmod 600 $Fn
+    done
+    aCheckList=()                         #生成扫描项的验证码文件，做为原始校验范本
+    ;;
+  c)
+    `cat /dev/null`>$LOGFILE
+    aCheckList=()
+    ;;                                      #清空日志
+  s)
+    for i in ${aCheckList[@]}
+    do
+      Search=`echo $i|awk -F, '{print $1}'`
+      Arg=`echo $i|awk -F, '{print $2}'`
+      t=`$FindCmd $Search -name "$Arg"`
+      for j in ${t[@]}
+      do
+        GetSummary $j                     #getsummary获取配置文件
+      done
+    done
+    aCheckList=()                         #生成所有扫描项的摘要文件
+    ;;
+  h)
+    echo "-h 获取帮助"
+    echo "-c 清空日志"
+    echo "-i 生成扫描项的验证码文件，做为原始校验范本"
+    echo "-s 生成所有扫描项的摘要文件"
+    aCheckList=()
+    ;;
+  *)
+  ;;
+esac
+done  
+if (( ${#aCheckList[@]} > 0 )); then            #${#aCheckList[@]}=3   3项
+  echo "checkfile start at "`date`>>$LOGFILE
+  aCheckResult=()
+  for i in ${aCheckList[@]}                 #$(aCheckList[@])==<待查目录>,<过滤条件>,<检测类型>,MD5码
+  do
+    Search=`echo $i|awk -F, '{print $1}'`
+    CheckFile $i
+    if (( $? == 1 )); then                     # checkok=0 文件没有变动
+      echo $Search" Check OK!" >>$LOGFILE
+    fi
+  done
+  #在合理的间隔时间内发送检测异常报告邮件
+  #此处可以进一步对检测结果的HASH值与上次结果的HASH值做对比,发现不同再报告.可以根据自身需求自行修改
+  if (( ${#aCheckResult[@]} > 0 )); then
+    NowTime=`date +%s`
+    SendTime=0
+    if [ -f $REMINDFLGFILE ]; then
+      SendTime=`cat $REMINDFLGFILE`
+    else
+      SendTime=0
+    fi
+    tDiff=$[ $NowTime - $SendTime ]
+    if (( $tDiff > $REMINDINTERVAL )); then
+      echo ${aCheckResult[@]}|sed "s/\s/\n/g" | mail -s "Check FAILED!" test@test.test 
+      #此处更换成自己的邮箱地址       \n replace \s
+      echo $NowTime >$REMINDFLGFILE
+    fi
+  fi
+  echo "checkfile finished at "`date`>>$LOGFILE
+fi
