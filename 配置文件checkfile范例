@@ -1,0 +1,2 @@
+/var/txt/,-name '*.txt',0
+/var/src/,-name '*.c',1
